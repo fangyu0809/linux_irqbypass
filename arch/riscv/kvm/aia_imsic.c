@@ -968,6 +968,39 @@ static struct kvm_vcpu *imsic_irqfd_route_vcpu(struct kvm *kvm,
 	return NULL;
 }
 
+static int imsic_irqfd_can_forward(struct kvm *kvm,
+				   struct kvm_kernel_irqfd *irqfd,
+				   struct kvm_kernel_irq_routing_entry *irq_entry,
+				   struct kvm_vcpu **vcpu)
+{
+	lockdep_assert_held(&kvm->irqfds.lock);
+
+	if (irq_entry->type != KVM_IRQ_ROUTING_MSI)
+		return -EOPNOTSUPP;
+
+	/*
+	 * irqbypass provides no platform MSI-message update interface, so this
+	 * direct-message path supports the VFIO PCI producer only. Limit it to
+	 * MSI-X because pci_write_msi_msg() masks an MSI-X vector around the
+	 * update, which conventional MSI cannot provide.
+	 */
+	if (kvm->arch.aia.mode != KVM_DEV_RISCV_AIA_MODE_HWACCEL ||
+	    !imsic_irqfd_is_msix(irqfd))
+		return -EOPNOTSUPP;
+
+	if (!imsic_targets_valid(&kvm->arch.aia)) {
+		pr_debug("KVM: IMSIC IRQ bypass requires all VS-files\n");
+		return -EOPNOTSUPP;
+	}
+
+	/* Leave guest messages that name no vIMSIC to software injection. */
+	*vcpu = imsic_irqfd_route_vcpu(kvm, irq_entry);
+	if (!*vcpu)
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
 static int imsic_irqfd_forward(struct kvm_kernel_irqfd *irqfd,
 			       struct kvm_kernel_irq_routing_entry *irq_entry)
 {
@@ -990,28 +1023,9 @@ static int imsic_irqfd_forward(struct kvm_kernel_irqfd *irqfd,
 
 	lockdep_assert_held(&kvm->irqfds.lock);
 
-	if (irq_entry->type != KVM_IRQ_ROUTING_MSI)
-		return -EOPNOTSUPP;
-
-	/*
-	 * irqbypass provides no platform MSI-message update interface, so this
-	 * direct-message path supports the VFIO PCI producer only. Limit it to
-	 * MSI-X because pci_write_msi_msg() masks an MSI-X vector around the
-	 * update, which conventional MSI cannot provide.
-	 */
-	if (kvm->arch.aia.mode != KVM_DEV_RISCV_AIA_MODE_HWACCEL ||
-	    !imsic_irqfd_is_msix(irqfd))
-		return -EOPNOTSUPP;
-
-	if (!imsic_targets_valid(&kvm->arch.aia)) {
-		pr_debug("KVM: IMSIC IRQ bypass requires all VS-files\n");
-		return -EOPNOTSUPP;
-	}
-
-	/* Leave guest messages that name no vIMSIC to software injection. */
-	vcpu = imsic_irqfd_route_vcpu(kvm, irq_entry);
-	if (!vcpu)
-		return -EOPNOTSUPP;
+	ret = imsic_irqfd_can_forward(kvm, irqfd, irq_entry, &vcpu);
+	if (ret)
+		return ret;
 
 	vcpu_info.msi_addr_pattern = (vcpu->arch.aia_context.imsic_addr >> IMSIC_MMIO_PAGE_SHIFT) &
 				     ~vcpu_info.msi_addr_mask;
@@ -1035,12 +1049,32 @@ void kvm_arch_update_irqfd_routing(struct kvm_kernel_irqfd *irqfd,
 				   struct kvm_kernel_irq_routing_entry *new)
 {
 	struct kvm *kvm = irqfd->kvm;
+	struct kvm_vcpu *vcpu;
+	struct msi_msg msg;
 	int ret;
 
 	if (old->type == KVM_IRQ_ROUTING_MSI &&
 	    new->type == KVM_IRQ_ROUTING_MSI &&
 	    !memcmp(&old->msi, &new->msi, sizeof(new->msi)))
 		return;
+
+	/*
+	 * Fast path: the producer stays forwarded and the new routing
+	 * still resolves to a vIMSIC. The active MSI page table covers
+	 * every vIMSIC page of the VM, so re-pointing the forwarding
+	 * vCPU and rewriting the device message is sufficient. No
+	 * IOMMU command is issued, so the IRQ descriptor lock is never
+	 * taken under irqfds.lock.
+	 */
+	if (irqfd->irq_bypass_vcpu &&
+	    !imsic_irqfd_can_forward(kvm, irqfd, new, &vcpu)) {
+		irqfd->irq_bypass_vcpu = vcpu;
+		msg.address_hi = new->msi.address_hi;
+		msg.address_lo = new->msi.address_lo;
+		msg.data = new->msi.data;
+		pci_write_msi_msg(irqfd->producer->irq, &msg);
+		return;
+	}
 
 	ret = kvm_riscv_irqfd_unforward(irqfd);
 	if (KVM_BUG(ret, kvm, "Failed to redirect IRQ to host delivery: %d\n", ret))
